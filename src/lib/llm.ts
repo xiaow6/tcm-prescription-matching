@@ -76,6 +76,66 @@ export async function analyzeSymptoms(
 }
 
 /**
+ * LLM Semantic Search: Send condensed index of ALL prescriptions to LLM,
+ * let it pick the best candidates using its understanding of TCM.
+ * Returns array of prescription IDs.
+ */
+export async function llmSelectCandidates(
+  symptomAnalysis: LLM1Output,
+  prescriptionIndex: string,
+  profileContext: string = ''
+): Promise<number[]> {
+  const systemPrompt = `你是中医辨证选方专家。根据患者症状分析，从处方索引中选出最匹配的处方。
+
+## 处方索引格式
+每行一个处方：编号|名称|类别|关键词|辨证要点
+
+## 选方原则
+1. 辨证论治优先：证型匹配是第一位
+2. 症状匹配：患者症状与处方适应症的重合度
+3. 人群匹配：年龄、性别、合并症等
+4. 注意鉴别相似处方（如胃肠合剂1-5方的区分）
+
+## 输出格式
+只输出 JSON 数组，包含最匹配的 3-5 个处方编号，按匹配度从高到低排列。
+不要输出任何其他内容。
+
+示例：[8, 9, 10]`;
+
+  const userMessage = `## 患者症状
+症状：${symptomAnalysis.symptoms?.join('、') || '未知'}
+症状特征：${symptomAnalysis.symptom_features || '未提供'}
+既往病史：${symptomAnalysis.medical_history || '未提供'}
+舌脉：${symptomAnalysis.tongue_pulse || '未提供'}
+初步辨证：${symptomAnalysis.preliminary_pattern || '待定'}
+${profileContext}
+
+## 全部处方索引（共86个）
+${prescriptionIndex}
+
+请选出最匹配的3-5个处方编号：`;
+
+  const response = await client.messages.create({
+    model: MODEL,
+    max_tokens: 256,
+    system: systemPrompt,
+    messages: [{ role: 'user', content: userMessage }],
+  });
+
+  const text = response.content[0].type === 'text' ? response.content[0].text : '';
+
+  const arrMatch = text.match(/\[[\d,\s]+\]/);
+  if (!arrMatch) return [];
+
+  try {
+    const ids = JSON.parse(arrMatch[0]) as number[];
+    return ids.filter(id => id >= 1 && id <= 86);
+  } catch {
+    return [];
+  }
+}
+
+/**
  * LLM2: Prescription matching and recommendation (streaming)
  */
 export async function matchPrescriptions(
@@ -97,7 +157,7 @@ export async function matchPrescriptions(
 初步辨证：${symptomAnalysis.preliminary_pattern || '待定'}
 ${profileContext}
 
-## 候选协定处方（来自知识库检索）
+## 候选协定处方（来自知识库检索 + AI 语义匹配）
 
 ${candidatePrescriptions}
 

@@ -1,7 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { analyzeSymptoms, matchPrescriptions } from '@/lib/llm';
+import { analyzeSymptoms, llmSelectCandidates, matchPrescriptions } from '@/lib/llm';
 import { searchPrescriptions } from '@/lib/prescriptionSearch';
-import { ChatRequest, UserProfile } from '@/lib/types';
+import { getPrescriptionById } from '@/lib/knowledgeBase';
+import { getPrescriptionIndex } from '@/lib/prescriptionIndex';
+import { ChatRequest, Prescription, UserProfile } from '@/lib/types';
 
 export const maxDuration = 60;
 
@@ -15,6 +17,19 @@ function formatProfileContext(profile?: UserProfile): string {
   if (profile.allergies) parts.push(`过敏史：${profile.allergies}`);
   if (profile.isPregnant !== undefined) parts.push(`是否怀孕：${profile.isPregnant ? '是' : '否'}`);
   return parts.length > 0 ? `\n\n## 患者基本信息\n${parts.join('\n')}` : '';
+}
+
+function formatPrescription(p: Prescription, source: string): string {
+  return `### ${p.name}（来源：${source}）
+- 编号：${p.id}
+- 类别：${p.category}
+- 功效：${p.efficacy}
+- 主治：${p.indication}
+- 适应症：${p.symptoms}
+- 辨证要点：${p.patternPoints}
+- 用法用量：${p.dosage}
+- 注意事项：${p.precautions}
+- 关键词：${p.keywords.join('、')}`;
 }
 
 export async function POST(req: NextRequest) {
@@ -39,14 +54,47 @@ export async function POST(req: NextRequest) {
         });
       }
 
-      const searchResults = searchPrescriptions(
+      // === Hybrid retrieval: keyword search + LLM semantic selection ===
+
+      // 1. Keyword search (fast, catches exact matches)
+      const keywordResults = searchPrescriptions(
         llm1Result.search_query || '',
         llm1Result.preliminary_pattern,
         llm1Result.possible_category,
         5
       );
 
-      if (searchResults.length === 0) {
+      // 2. LLM semantic selection (understands TCM context, catches what keywords miss)
+      const prescriptionIndex = getPrescriptionIndex();
+      let llmSelectedIds: number[] = [];
+      try {
+        llmSelectedIds = await llmSelectCandidates(llm1Result, prescriptionIndex, profileContext);
+      } catch (e) {
+        console.error('LLM selection failed, falling back to keyword only:', e);
+      }
+
+      // 3. Merge results: deduplicate, LLM picks + keyword picks
+      const seenIds = new Set<number>();
+      const mergedPrescriptions: { prescription: Prescription; source: string }[] = [];
+
+      // LLM selections first (higher trust for semantic understanding)
+      for (const id of llmSelectedIds) {
+        if (seenIds.has(id)) continue;
+        const p = getPrescriptionById(id);
+        if (p) {
+          seenIds.add(id);
+          mergedPrescriptions.push({ prescription: p, source: 'AI语义匹配' });
+        }
+      }
+
+      // Then keyword results
+      for (const r of keywordResults) {
+        if (seenIds.has(r.prescription.id)) continue;
+        seenIds.add(r.prescription.id);
+        mergedPrescriptions.push({ prescription: r.prescription, source: `关键词匹配(${r.score.toFixed(0)}分)` });
+      }
+
+      if (mergedPrescriptions.length === 0) {
         return NextResponse.json({
           type: 'no_match',
           message: locale === 'en'
@@ -56,20 +104,12 @@ export async function POST(req: NextRequest) {
         });
       }
 
-      const candidateText = searchResults.map((r, i) => {
-        const p = r.prescription;
-        return `### 候选${i + 1}：${p.name}（匹配评分：${r.score.toFixed(1)}）
-- 编号：${p.id}
-- 类别：${p.category}
-- 功效：${p.efficacy}
-- 主治：${p.indication}
-- 适应症：${p.symptoms}
-- 辨证要点：${p.patternPoints}
-- 用法用量：${p.dosage}
-- 注意事项：${p.precautions}
-- 关键词：${p.keywords.join('、')}`;
-      }).join('\n\n');
+      // 4. Format candidates (max 7 to keep context reasonable)
+      const candidateText = mergedPrescriptions.slice(0, 7).map(({ prescription, source }) =>
+        formatPrescription(prescription, source)
+      ).join('\n\n');
 
+      // 5. LLM2: Stream the final recommendation
       const stream = await matchPrescriptions(llm1Result, candidateText, profileContext, locale);
 
       return new Response(stream, {
