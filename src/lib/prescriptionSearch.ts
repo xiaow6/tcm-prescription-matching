@@ -4,7 +4,7 @@ import { getPrescriptions, getPrescriptionChunks } from './knowledgeBase';
 /**
  * Search prescriptions using keyword matching + scoring algorithm
  *
- * Score = 证型匹配(0-40) + 关键词匹配(0-30) + 适应症匹配(0-20) + 类别匹配(0-10)
+ * Score = 处方名匹配(0-50) + 证型/辨证匹配(0-40) + 关键词匹配(0-30) + 适应症匹配(0-20) + 类别匹配(0-10)
  */
 export function searchPrescriptions(
   searchQuery: string,
@@ -15,7 +15,6 @@ export function searchPrescriptions(
   const prescriptions = getPrescriptions();
   const chunks = getPrescriptionChunks();
 
-  // Tokenize search query into individual terms
   const searchTerms = searchQuery
     .split(/[\s,，、;；]+/)
     .map(t => t.trim())
@@ -29,7 +28,17 @@ export function searchPrescriptions(
     const prescription = prescriptions[i];
     const chunk = chunks[i];
 
-    // 1. Pattern matching (0-40 points)
+    // 0. Prescription name direct match (bonus 0-50)
+    //    If a search term appears in the prescription name, it's a strong signal
+    let nameBonus = 0;
+    for (const term of searchTerms) {
+      if (term.length >= 2 && prescription.name.includes(term)) {
+        nameBonus = 50;
+        break;
+      }
+    }
+
+    // 1. Pattern / 辨证要点 matching (0-40 points)
     let patternScore = 0;
     if (preliminaryPattern) {
       const patterns = preliminaryPattern.split(/[\s,，、;；]+/).filter(Boolean);
@@ -39,10 +48,9 @@ export function searchPrescriptions(
           break;
         }
       }
-      // Partial match: check if pattern keywords appear
+      // Partial match
       if (patternScore === 0) {
         for (const pattern of patterns) {
-          // Check each character pair for partial match
           if (pattern.length >= 2) {
             for (let j = 0; j < pattern.length - 1; j++) {
               const pair = pattern.substring(j, j + 2);
@@ -51,6 +59,16 @@ export function searchPrescriptions(
               }
             }
           }
+        }
+      }
+    }
+    // Also check if search terms appear in patternPoints directly
+    // (handles cases where patternPoints contains disease names, not just TCM patterns)
+    if (patternScore < 40) {
+      for (const term of searchTerms) {
+        if (term.length >= 2 && prescription.patternPoints.includes(term)) {
+          patternScore = Math.max(patternScore, 30);
+          break;
         }
       }
     }
@@ -69,15 +87,11 @@ export function searchPrescriptions(
       ? (keywordMatches / searchTerms.length) * 30
       : 0;
 
-    // 3. Symptom matching (0-20 points)
+    // 3. Symptom + indication matching (0-20 points)
     let symptomHits = 0;
     for (const term of searchTerms) {
-      if (prescription.symptoms.includes(term)) {
-        symptomHits++;
-      }
-      if (prescription.indication.includes(term)) {
-        symptomHits++;
-      }
+      if (prescription.symptoms.includes(term)) symptomHits++;
+      if (prescription.indication.includes(term)) symptomHits++;
     }
     const maxSymptomHits = searchTerms.length * 2;
     const symptomScore = maxSymptomHits > 0
@@ -90,14 +104,14 @@ export function searchPrescriptions(
       categoryScore = 10;
     }
 
-    const totalScore = patternScore + keywordScore + symptomScore + categoryScore;
+    const totalScore = nameBonus + patternScore + keywordScore + symptomScore + categoryScore;
 
     if (totalScore > 0) {
       results.push({
         prescription,
         score: totalScore,
         details: {
-          patternScore,
+          patternScore: patternScore + nameBonus,
           keywordScore,
           symptomScore,
           categoryScore,
@@ -106,7 +120,6 @@ export function searchPrescriptions(
     }
   }
 
-  // Sort by score descending
   results.sort((a, b) => b.score - a.score);
 
   return results.slice(0, topK);
